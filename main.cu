@@ -160,16 +160,17 @@ int main() {
 	printf("Algorithm running time is %lld ms\n", elapsedTime);
 
 	// 输出结果
-	for (auto i = 0; i < ARG_NUM + 1; ++i) {
-		printf("%f ", hostArgList[i]);
+	for (auto i = 0; i < ARG_NUM; ++i) {
+		printf("x%d = %f\n", i + 1, hostArgList[i]);
 	}
+	printf("Result = %f\n", hostArgList[ARG_NUM]);
 
 	// 测试结果
 	auto realResult = 0.;
 	for (auto i = 0; i < ARG_NUM; ++i) {
 		realResult += pow(-1, i + 1) * pow(hostArgList[i], i + 1) * (i + 1);
 	}
-	printf("\n%f", realResult + BIAS);
+	printf("Validating Result = %f\n", realResult + BIAS);
 	
 	// 释放CPU存储
 	free(hostArgList);
