@@ -5,7 +5,7 @@
 #include "utils.h"
 
 using namespace std;
-using namespace std::chrono;
+using namespace chrono;
 
 #define BLOCK_NUM  512		// GPU块数量
 #define BLOCK_SIZE 512		// GPU块大小
