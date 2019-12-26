@@ -2,14 +2,16 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <chrono>
+#include <curand.h>
 #include "utils.h"
 
 using namespace std;
 using namespace chrono;
 
-#define BLOCK_NUM  512		// GPU块数量
+#define BLOCK_NUM  64		// GPU块数量
 #define BLOCK_SIZE 512		// GPU块大小
-#define ITERATIONS 10000	// 差分进化次数
+#define RAND_SIZE  1000		// CUDA随机数队列大小
+#define ITERATIONS 1000		// 差分进化次数
 #define ARG_NUM	   10		// 参数个数
 #define ARG_LIMIT  100		// 参数绝对值范围限制
 #define BIAS	   22		// 偏差
@@ -45,28 +47,28 @@ __global__ void DifferentialEvolution(const double* arg_list, double* result_lis
 		int r1, r2, r3;
 		do {
 			r1 = int(rand[randIndex] * ARG_NUM) % ARG_NUM;
-			randIndex = (randIndex + step) % INT16_MAX;
+			randIndex = (randIndex + step) % RAND_SIZE;
 			r2 = int(rand[randIndex] * ARG_NUM) % ARG_NUM;
-			randIndex = (randIndex + step) % INT16_MAX;
+			randIndex = (randIndex + step) % RAND_SIZE;
 			r3 = int(rand[randIndex] * ARG_NUM) % ARG_NUM;
-			randIndex = (randIndex + step) % INT16_MAX;
+			randIndex = (randIndex + step) % RAND_SIZE;
 		}
 		while (r1 == r2 || r2 == r3 || r1 == r3);
 		results[threadIdx.x][i] = arg_list[r1] + F * (arg_list[r2] - arg_list[r3]);
 		if (abs(results[threadIdx.x][i]) > ARG_LIMIT) {
 			results[threadIdx.x][i] = (rand[randIndex] - 0.5) * 2 * ARG_LIMIT;
-			randIndex = (randIndex + step) % INT16_MAX;
+			randIndex = (randIndex + step) % RAND_SIZE;
 		}
 	}
 	
 	// 交叉
 	const auto j = int(rand[randIndex] * ARG_NUM) % ARG_NUM;
-	randIndex = (randIndex + step) % INT16_MAX;
+	randIndex = (randIndex + step) % RAND_SIZE;
 	for (auto i = 0; i < ARG_NUM; ++i) {
 		if (i != j && rand[randIndex] > CR) {
 			results[threadIdx.x][i] = arg_list[i];
 		}
-		randIndex = (randIndex + step) % INT16_MAX;		
+		randIndex = (randIndex + step) % RAND_SIZE;		
 	}
 
 	// 计算
@@ -96,6 +98,26 @@ __global__ void DifferentialEvolution(const double* arg_list, double* result_lis
 	}
 }
 
+
+/**
+ * \brief 在GPU上进行子代选择，仅使用单线程
+ * \param arg_list 当前最优参数列表
+ * \param result_list GPU计算得到的最优子代参数及其结果
+ */
+__global__ void SelectNextGeneration(double* arg_list, const double* result_list) {
+	if (threadIdx.x == 0 && blockIdx.x == 0) {		
+		auto bestResult = -1;
+		for (auto j = 0; j < BLOCK_NUM; ++j) {
+			if (abs(result_list[j * (ARG_NUM + 1) + ARG_NUM]) < abs(arg_list[ARG_NUM])) {
+				bestResult = j;
+			}
+		}			
+		if (bestResult >= 0) {
+			memcpy(arg_list, &result_list[bestResult * (ARG_NUM + 1)], sizeof(double) * (ARG_NUM + 1));
+		}
+	}
+}
+
 int main() {
 	// 当前最优参数列表及其结果（[argv], result）
 	const auto hostArgList = static_cast<double*>(malloc(sizeof(double) * (ARG_NUM + 1)));
@@ -107,10 +129,7 @@ int main() {
 	// GPU计算得到的最优子代参数及其结果
 	double* deviceResultList;
 	checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&deviceResultList), sizeof(double) * BLOCK_NUM * (ARG_NUM + 1)));
-	
-	// 计算结果在CPU存储中的缓冲区
-	const auto hostResultList = static_cast<double*>(malloc(sizeof(double) * BLOCK_NUM * (ARG_NUM + 1)));
-	
+
 	// 初始化种群
 	srand(time(nullptr));
 	for (auto i = 0; i < ARG_NUM; ++i) {
@@ -125,39 +144,33 @@ int main() {
 		hostArgList[ARG_NUM] += temp;
 	}
 	hostArgList[ARG_NUM] += BIAS;
-		
+
+	// 初始化CUDA随机数生成器及缓冲区
+	double *deviceRand1, *deviceRand2;
+	checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&deviceRand1), sizeof(double) * RAND_SIZE));
+	checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&deviceRand2), sizeof(double) * RAND_SIZE));
+    curandGenerator_t deviceRandGenerator;
+	curandCreateGenerator(&deviceRandGenerator, CURAND_RNG_PSEUDO_DEFAULT);
+	curandSetPseudoRandomGeneratorSeed(deviceRandGenerator, time(nullptr));
+	curandGenerateUniformDouble(deviceRandGenerator, deviceRand1, RAND_SIZE);
+	
 	// 差分进化	
-	const auto start = system_clock::now();
-	for (auto i = 0; i < ITERATIONS; ++i) {		
-		// 预生成随机数队列
-		double hostRand[INT16_MAX];
-		for (auto j = 0; j < INT16_MAX; ++j) {
-			hostRand[j] = double(rand()) / RAND_MAX;
-		}
-		double* deviceRand;
-		checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&deviceRand), sizeof(double) * INT16_MAX));
-		checkCudaErrors(cudaMemcpy(deviceRand, hostRand, sizeof(double) * INT16_MAX, cudaMemcpyHostToDevice));
-
+	checkCudaErrors(cudaMemcpy(deviceArgList, hostArgList, sizeof(double) * (ARG_NUM + 1), cudaMemcpyHostToDevice));
+	const auto start = system_clock::now();	
+	for (auto i = 0; i < ITERATIONS; ++i) {
 		// GPU计算最优子代结果
-		checkCudaErrors(cudaMemcpy(deviceArgList, hostArgList, sizeof(double) * (ARG_NUM + 1), cudaMemcpyHostToDevice));
-		DifferentialEvolution<<<BLOCK_NUM, BLOCK_SIZE>>>(deviceArgList, deviceResultList, deviceRand);
+		DifferentialEvolution<<<BLOCK_NUM, BLOCK_SIZE>>>(deviceArgList, deviceResultList, i % 2 ? deviceRand2 : deviceRand1);
+		
+		// 重新生成随机数队列
+		curandGenerateUniformDouble(deviceRandGenerator, i % 2 ? deviceRand1 : deviceRand2, RAND_SIZE);
+		
+		// 进行子代选择
 		cudaDeviceSynchronize();
-		
-		// 拷贝GPU结果到CPU
-		checkCudaErrors(cudaMemcpy(hostResultList, deviceResultList, sizeof(double) * BLOCK_NUM * (ARG_NUM + 1), cudaMemcpyDeviceToHost));
-		
-		// CPU进行子代选择		
-		for (auto j = 0; j < BLOCK_NUM; ++j) {
-			if (abs(hostResultList[j * (ARG_NUM + 1) + ARG_NUM]) < abs(hostArgList[ARG_NUM])) {
-				memcpy(hostArgList, &hostResultList[j * (ARG_NUM + 1)], sizeof(double) * (ARG_NUM + 1));
-			}
-		}
-
-		// 释放随机数队列
-		checkCudaErrors(cudaFree(deviceRand));		
+		SelectNextGeneration<<<1, 1>>>(deviceArgList, deviceResultList);
 	}
 	const auto elapsedTime = duration_cast<milliseconds>(system_clock::now() - start).count();
 	printf("Algorithm running time is %lld ms\n", elapsedTime);
+	checkCudaErrors(cudaMemcpy(hostArgList, deviceArgList, sizeof(double) * (ARG_NUM + 1), cudaMemcpyDeviceToHost));
 
 	// 输出结果
 	for (auto i = 0; i < ARG_NUM; ++i) {
@@ -174,9 +187,10 @@ int main() {
 	
 	// 释放CPU存储
 	free(hostArgList);
-	free(hostResultList);
 
 	// 释放GPU存储
+	checkCudaErrors(cudaFree(deviceRand1));
+	checkCudaErrors(cudaFree(deviceRand2));
 	checkCudaErrors(cudaFree(deviceArgList));
 	checkCudaErrors(cudaFree(deviceResultList));
 }
